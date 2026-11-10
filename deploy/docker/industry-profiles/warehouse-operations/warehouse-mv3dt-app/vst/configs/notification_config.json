@@ -23,11 +23,34 @@
           {
             "url": "http://127.0.0.1:18088/bdd/webhooks/camera/add",
             "method": "POST",
-            "headers": {"Content-Type": "application/json", "x-stream-id": "{{event.camera_id}}"},
-            "query_params": {"change": "{{event.change}}"},
-            "camera_type": ["rtsp", "file"],
+            "headers": {
+              "Content-Type": "application/json",
+              "x-stream-id": "{{event.camera_id}}"
+            },
+            "query_params": {
+              "change": "{{event.change}}"
+            },
+            "camera_type": [
+              "rtsp",
+              "file"
+            ],
             "timeout_ms": 5000,
-            "retry": {"max_attempts": 3, "backoff_ms": [1000, 5000, 15000], "retry_on_status": [408, 429, 500, 502, 503, 504]}
+            "retry": {
+              "max_attempts": 3,
+              "backoff_ms": [
+                1000,
+                5000,
+                15000
+              ],
+              "retry_on_status": [
+                408,
+                429,
+                500,
+                502,
+                503,
+                504
+              ]
+            }
           }
         ]
       }

@@ -133,11 +133,11 @@
 		},
 		{
 			"name": "sourceType",
-			"value": "kafka"
+			"value": "redisStream"
 		},
 		{
 			"name": "sinkType",
-			"value": "kafka"
+			"value": "redisStream"
 		},
 		{
 			"name": "numWorkersForBehaviorCreation",

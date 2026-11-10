@@ -35,9 +35,9 @@ num-source-bins=0
 # Set use-nvmultiurisrcbin to 1 to enable sensor provisioning/update feature
 use-nvmultiurisrcbin=1
 stream-name-display=1
-max-batch-size=3
+max-batch-size=4
 http-ip=0.0.0.0
-low-latency-mode=1
+low-latency-mode=0
 http-port=9000
 extract-sei-type5-data=1
 sei-uuid=NVDS_CUSTOMMETA
@@ -81,17 +81,17 @@ msg-conv-payload-type=2
 msg-conv-msg2p-new-api=0
 #Frame interval at which payload is generated
 msg-conv-frame-interval=1
-msg-broker-proto-lib=/opt/nvidia/deepstream/deepstream/lib/libnvds_kafka_proto.so
+msg-broker-proto-lib=/opt/nvidia/deepstream/deepstream/lib/libnvds_redis_proto.so
 #Provide your msg-broker-conn-str here
 #msg-broker-conn-str=qvs-ds-kafka-01;9092;metromind-raw
 #topic=metromind-raw
 # msg-broker-conn-str=mdx-kafka-cluster-kafka-brokers;9092;mdx-raw
-msg-broker-conn-str=kafka;29092;mdx-raw
-msg-conv-msg2p-lib=/opt/nvidia/deepstream/deepstream/lib/libnvds_msgconv_mega2d.so
+msg-broker-conn-str=redis;6379;
+msg-conv-msg2p-lib=/opt/nvidia/deepstream/deepstream/lib/libnvds_msgconv.so
 #topic=mdx-raw
 topic=mdx-raw
 #Optional:
-msg-broker-config=ds-kafka-config.txt
+msg-broker-config=ds-redis-config.txt
 #new-api=0
 #(0) Use message adapter library api's
 #(1) Use new msgbroker library api's
@@ -160,7 +160,7 @@ nvbuf-memory-type=0
 gpu-id=0
 ##Boolean property to inform muxer that sources are live
 live-source=1
-batch-size=3
+batch-size=4
 ##time out in usec, to wait after the first buffer is available
 ##to push the batch even if the complete batch is not formed
 batched-push-timeout=33000
@@ -186,7 +186,7 @@ enable=1
 gpu-id=0
 #Required to display the PGIE labels, should be added even when using config-file
 #property
-batch-size=3
+batch-size=4
 #Required by the app for OSD, not a plugin property
 bbox-border-color0=1;0;0;1
 bbox-border-color1=0;1;1;1
@@ -209,7 +209,7 @@ ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.s
 #ll-config-file=/opt/configs/config_tracker_NvDCF_perf.yml
 ll-config-file=ds-nvdcf-accuracy-tracker-config.yml
 # ll-config-file=/opt/configs/config_tracker_DeepSORT.yml
-compute-hw=0
+compute-hw=2
 gpu-id=0
 display-tracking-id=1
 
@@ -218,7 +218,7 @@ enable=0
 backend=tensorrt
 tensorrt-engine=/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/models/model_batch16.plan
 onnx-model=/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/models/cradio.onnx
-batch-size=3
+batch-size=4
 min-crop-size=32
 verbose=1
 gpu-id=0
@@ -230,7 +230,7 @@ gpu-id=0
 gie-unique-id=2
 operate-on-gie-id=1
 operate-on-class-ids=0
-batch-size=3
+batch-size=4
 config-file=ppl_analytics_sgie_config.txt
 
 [tests]

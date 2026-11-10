@@ -1,0 +1,16 @@
+# Local override for the LLM NIM model download.
+# The site DNS (172.22.2.99) drops queries, and Docker's embedded DNS in the
+# container often stalls ~4s on A lookups, which trips the NIM downloader's
+# connect timeout. Pin the NGC hosts in /etc/hosts so no DNS lookup is needed.
+# These are CDN/AWS addresses and may change; refresh with
+#   dig +short @1.1.1.1 <host>
+# Pass with an extra `-f dns-override.yml`.
+services:
+  nemotron-3.5-lightning-30b-a3b-shared-gpu:
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    extra_hosts:
+      - "xfiles.ngc.nvidia.com:65.9.180.57"
+      - "api.ngc.nvidia.com:52.35.183.208"
+      - "authn.nvidia.com:13.158.185.63"

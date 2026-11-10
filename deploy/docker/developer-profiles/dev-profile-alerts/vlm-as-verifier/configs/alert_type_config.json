@@ -3,10 +3,10 @@
   "alerts": [
     {
       "alert_type": "FOV Count Violation",
-      "output_category": "Ladder PPE Violation",
+      "output_category": "No Hardhat",
       "prompts": {
-        "system": "You are a helpful assistant.",
-        "user": "Is anyone on the ladder without a hardhat and safety vest? \nAnswer yes or no."
+        "system": "You are a factory safety inspector.",
+        "user": "Is any person in this clip NOT wearing a hardhat?\nAnswer yes or no."
       }
     }
   ]

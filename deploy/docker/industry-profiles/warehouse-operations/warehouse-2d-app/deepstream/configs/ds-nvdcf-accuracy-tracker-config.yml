@@ -18,7 +18,7 @@ BaseConfig:
 TargetManagement:
   enableBboxUnClipping: 1
   preserveStreamUpdateOrder: 0
-  maxTargetsPerStream: 150
+  maxTargetsPerStream: 50
   minIouDiff4NewTarget: 0.40803391831819774
   minTrackerConfidence: 0.2379867160124702
   probationAge: 2
@@ -64,7 +64,7 @@ StateEstimator:
   measurementNoiseVar4Detector: 100.00000497224985
   measurementNoiseVar4Tracker: 294.4755412477389
 VisualTracker:
-  visualTrackerType: 1    # the type of visual tracker among { DUMMY=0, NvDCF_legacy=1, NvDCF_VPI=2 }
+  visualTrackerType: 2    # the type of visual tracker among { DUMMY=0, NvDCF_legacy=1, NvDCF_VPI=2 }
   vpiBackend4DcfTracker: 1
   # [NvDCF: Feature Extraction]
   useColorNames: 1    # Use ColorNames feature
