@@ -31,6 +31,7 @@ NvStreamer(4 支 mp4) ─RTSP→ VST(VIOS) ─RTSP→ RT-CV MV3DT ─mdx-raw→ 
 | 其他 `deploy/docker/**/configs/` 下 json、txt、yml 的修改 | **blueprint-configurator 部署時自動改寫**的結果（不是手改的）。重新部署時會再被改寫，可以不必在意 |
 | `deploy/docker/dns-override.yml` | 站點 DNS 不穩時，給 LLM NIM 用的 DNS / hosts 覆寫（本次 mv3dt 部署沒用到） |
 | `.gitignore` | 排除 configurator 的 `*.backup_*`、TensorRT engines、資料目錄、`resolved.yml` 等 |
+| `.lfsconfig` | Git LFS 物件改從上游下載，本 fork 不存 LFS 本體（見 §2.1） |
 
 ---
 
@@ -109,9 +110,13 @@ for p in 7777 9092 1883 9090 9200 5601 8081 30888 31000 35000 29192 21883 8091; 
 git clone https://github.com/fabian415/vss.git video-search-and-summarization
 cd video-search-and-summarization
 git remote add upstream https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization.git
+git lfs pull        # LFS 檔案依 .lfsconfig 從 NVIDIA 公開上游下載
 ```
 
 > 請用 `umask 022` 的 shell clone；`027` 會讓容器讀不到 bind-mount 的設定檔。
+
+> **關於 Git LFS：** 上游 repo 用 Git LFS 存了約 1 GB 以上的預編譯 `.so`、wheel、範例影片。本 fork **不另存 LFS 物件**，`.lfsconfig` 把 LFS 來源指向上游，所以 clone 時會自動從上游下載。
+> 推送到本 fork 時請用 `git push --no-verify ...`，跳過 git-lfs 的 pre-push 上傳；否則會把上游所有 LFS 物件重傳一份到你的 GitHub LFS 空間。
 
 ### 2.2 下載 warehouse app-data（約數 GB）
 

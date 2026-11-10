@@ -1,0 +1,4 @@
+# Git LFS objects (prebuilt .so, wheels, sample media) are NOT mirrored to this fork.
+# Fetch them from the public upstream instead; pushes to the fork use `git push --no-verify`.
+[lfs]
+	url = https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization.git/info/lfs
