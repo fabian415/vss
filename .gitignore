@@ -52,3 +52,26 @@ deploy/helm/**/charts/*.tgz
 # the Dockerfiles' pinned VSS_REF fetch).
 .openclaw/.vss-src/
 .hermes/.vss-src/
+
+# --- fabian415: local runtime artifacts (warehouse deploy on IGX Thor) ---
+# blueprint-configurator writes a backup next to every config it rewrites
+*.backup_[0-9]*_[0-9]*.*
+*.json_bak
+# runtime data and TensorRT engines (large, host-specific)
+deploy/docker/data-dir/
+deploy/docker/engines/
+# generated at deploy time by sdr-controller / wdm-env-from-config
+deploy/docker/industry-profiles/warehouse-operations/warehouse-*-app/sdrc/configs/
+deploy/docker/services/infra/sdrc/.wdm-env/
+# empty bind-mount placeholders Docker creates
+deploy/docker/services/vios/configs/Top.png
+deploy/docker/services/vios/configs/calibration.json
+deploy/docker/services/vios/configs/labels.txt
+# build secrets: resolved.yml bakes NGC_CLI_API_KEY in; configurator.env is regenerated
+_builds/*/resolved.yml
+_builds/*/configurator.env
+_builds/*/*.log
+_builds/*/.config.err
+# bev-live runtime logs
+apps/bev-live/*.log
+apps/bev-live/*.err
