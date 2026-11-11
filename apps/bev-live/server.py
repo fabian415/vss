@@ -87,8 +87,9 @@ def kafka_loop():
             continue  # 亂序/重複
         last_bucket = bucket
         t = f.timestamp.seconds * 1000 + f.timestamp.nanos // 1_000_000
+        # [id, x, y, type]；type 用來在前端分類計數與換形狀
         payload = json.dumps({"t": t, "o": [[o.id, round(o.bbox3d.coordinates[0], 3),
-                                             round(o.bbox3d.coordinates[1], 3)]
+                                             round(o.bbox3d.coordinates[1], 3), o.type]
                                             for o in f.objects if len(o.bbox3d.coordinates) >= 2]},
                              separators=(",", ":"))
         stats["frames"] += 1
