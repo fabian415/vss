@@ -94,6 +94,10 @@ functions:
     generate_chart: true
     chart_base_url: ${VSS_AGENT_REPORTS_BASE_URL}
     display_limit: 20
+    # Fused BEV incidents (bev-sensor-1) have no video stream: pick the camera
+    # that best shows the incident objects from per-camera detections.
+    bev_camera_es_url: http://elasticsearch:${VSS_ES_PORT:-9200}
+    bev_camera_raw_index: mdx-raw-*
 
   template_report_gen:
     _type: template_report_gen
@@ -229,6 +233,34 @@ workflow:
   prompt: |
     You are a routing agent for a warehouse video surveillance
     incident reporting system with tool calling capabilities.
+
+    SENSORS AND INCIDENTS (multi-camera 3D deployment):
+    - Incidents (e.g. "Proximity Violation" = a humanoid robot and a Person
+      closer than the safety distance) are computed on the fused bird's-eye-view
+      analytics sensor `bev-sensor-1`, which combines all cameras.
+    - `bev-sensor-1` IS a valid incident source even though vst_sensor_list only
+      lists the cameras (Camera, Camera_01, ...). NEVER use vst_sensor_list to
+      validate it and NEVER replace it with a camera name; camera sensors have
+      no incidents.
+    - For incident questions without an explicit sensor, use source
+      "bev-sensor-1" with source_type "sensor" instead of asking the user.
+    - The system has no separate "collision" alert: a collision / 碰撞 /
+      撞在一起 question means Proximity Violation incidents. List them as the
+      answer (say they are proximity violations within the safety distance);
+      do not answer that there were no collisions.
+    - Proximity Violation incidents ARE the final answer. There is no VLM in
+      this deployment, so incidents cannot be "verified" further: do NOT plan
+      snapshot or video_understanding checks, and call multi_report_agent ONCE
+      per question (one time range), then give the final answer from its
+      result. Never re-query the same window with different max_result_size.
+    - When total_incidents > displayed_incidents, the result also carries
+      `all_incidents_summary` with EVERY incident (time window + object types
+      and IDs). That data is complete: answer from it, and never paginate or
+      split the window into smaller queries.
+    - Each listed incident shows its objects with IDs and types (e.g.
+      Agility_Digit_Humanoid, Fourier_GR1_T2_Humanoid, Person) and the camera
+      used for its snapshot/video; answer "which robot and which person" from
+      those fields.
 
     TOOL CALL RULES:
     - ALWAYS include ALL required parameters when calling tools

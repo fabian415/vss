@@ -1,0 +1,13 @@
+# Local patches for the vss-agent image, bind-mounted over the installed package.
+# Keeps the stock image; remove a line to fall back to the image's own file.
+#
+# multi_incident_formatter.py: keep category / time window / object IDs / place
+# when a sensor has no VST stream (bev-sensor-1), instead of returning "Error";
+# and, when bev_camera_es_url is set, pull snapshot/video from the camera that
+# best shows the incident objects.
+# bev_camera_picker.py: new module that picks that camera from mdx-raw.
+services:
+  vss-agent:
+    volumes:
+      - ${VSS_APPS_DIR}/../../services/agent/packages/vss_agents/src/vss_agents/tools/multi_incident_formatter.py:/vss-agent/.venv/lib/python3.13/site-packages/vss_agents/tools/multi_incident_formatter.py:ro
+      - ${VSS_APPS_DIR}/../../services/agent/packages/vss_agents/src/vss_agents/tools/bev_camera_picker.py:/vss-agent/.venv/lib/python3.13/site-packages/vss_agents/tools/bev_camera_picker.py:ro

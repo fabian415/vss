@@ -190,6 +190,14 @@
 		{
 			"name": "numWorkersForSpaceEstimation",
 			"value": "0"
+		},
+		{
+			"name": "proximityViolationIncidentEnable",
+			"value": "true"
+		},
+		{
+			"name": "proximityViolationIncidentThreshold",
+			"value": "1.0"
 		}
 	]
 }

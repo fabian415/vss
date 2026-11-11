@@ -34,6 +34,8 @@ from pydantic import BaseModel
 from pydantic import Field
 from pydantic import field_validator
 
+from vss_agents.tools.bev_camera_picker import BevCameraPicker
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +94,15 @@ class MultiIncidentFormatterConfig(FunctionBaseConfig, name="multi_incident_form
         le=100,
         description="Maximum number of incidents to format and display in UI with full details (video/snapshot URLs). "
         "Charts will show all fetched incidents regardless of this limit.",
+    )
+    bev_camera_es_url: str | None = Field(
+        default=None,
+        description="Elasticsearch URL used to pick a camera for incidents whose sensor has no video stream "
+        "(e.g. a fused BEV sensor). Unset disables the fallback.",
+    )
+    bev_camera_raw_index: str = Field(
+        default="mdx-raw-*",
+        description="Index pattern of per-camera detections used by the BEV camera fallback.",
     )
 
 
@@ -175,7 +186,9 @@ async def _fetch_incidents(
         "start_time": formatter_input.start_time,
         "end_time": formatter_input.end_time,
         "max_count": formatter_input.max_result_size,
-        "includes": ["object_ids", "info", "category"],
+        # ES _source field names, passed through verbatim by the VA MCP server
+        # ("object_ids" matched nothing, so objectIds never came back).
+        "includes": ["objectIds", "info", "category", "place"],
         "vlm_verified": formatter_input.vlm_verified,
     }
     result = await incidents_tool.ainvoke(input=tool_input)
@@ -235,43 +248,95 @@ async def _format_single_incident(
     video_url_tool: Any,
     picture_url_tool: Any,
     incident_number: int,
+    camera_picker: BevCameraPicker | None = None,
+    aliases: dict[str, str] | None = None,
 ) -> dict:
-    """Format a single incident as a JSON object with video and image URLs."""
-    try:
-        logger.info(f"Processing incident {incident.incident_id}")
+    """Format a single incident as a JSON object with video and image URLs.
 
-        # Get video URL
+    The incident's own fields (category, time window, objects, place) always come
+    through. Video/snapshot URLs are best effort: a sensor with no VST stream
+    (e.g. a fused BEV sensor such as ``bev-sensor-1``) yields "Unavailable" for
+    those two fields instead of discarding the whole incident.
+    """
+    logger.info(f"Processing incident {incident.incident_id}")
+    clip_info: dict[str, Any] = {
+        "Timestamp": incident.start_timestamp,
+        "End Timestamp": incident.end_timestamp,
+        "Stream": incident.sensor_id,
+        "snapshot_url": "Unavailable",
+        "video_url": "Unavailable",
+    }
+    alert_details: dict[str, Any] = {
+        "Incident ID": incident.incident_id,
+        "Alert Category": incident.metadata.get("category") or "Unknown Alert",
+    }
+    object_ids = incident.metadata.get("objectIds") or []
+    canonical_ids, merged = _merge_ids(object_ids, aliases)
+    if object_ids:
+        alert_details["Object IDs"] = canonical_ids
+    if merged:
+        alert_details["Merged Duplicate IDs"] = merged
+    info = incident.metadata.get("info") or {}
+    if info.get("primaryObjectId"):
+        alert_details["Primary Object ID"] = info["primaryObjectId"]
+    place = incident.metadata.get("place") or {}
+    if isinstance(place, dict) and place.get("name"):
+        alert_details["Place"] = place["name"]
+    if camera_picker is not None and object_ids:
+        try:
+            types = await camera_picker.object_types(canonical_ids, incident.start_timestamp, incident.end_timestamp)
+            if types:
+                alert_details["Objects"] = [
+                    {"id": obj_id, "type": types.get(obj_id, "Unknown")} for obj_id in canonical_ids
+                ]
+        except Exception as e:
+            logger.warning(f"Object type lookup failed for incident {incident.incident_id}: {e!r}")
+
+    async def _fetch_media(sensor_id: str) -> None:
         video_url_result = await video_url_tool.ainvoke(
             input={
-                "sensor_id": incident.sensor_id,
+                "sensor_id": sensor_id,
                 "start_time": incident.start_timestamp,
                 "end_time": incident.end_timestamp,
             }
         )
-        video_url = video_url_result.video_url if hasattr(video_url_result, "video_url") else str(video_url_result)
-
-        # Get picture URL
         picture_url_result = await picture_url_tool.ainvoke(
             input={
-                "sensor_id": incident.sensor_id,
+                "sensor_id": sensor_id,
                 "start_time": incident.start_timestamp,
             }
         )
-        snapshot_url = (
+        clip_info["video_url"] = (
+            video_url_result.video_url if hasattr(video_url_result, "video_url") else str(video_url_result)
+        )
+        clip_info["snapshot_url"] = (
             picture_url_result.image_url if hasattr(picture_url_result, "image_url") else str(picture_url_result)
         )
 
-        clip_info = {
-            "Timestamp": incident.start_timestamp,
-            "Stream": incident.sensor_id,
-            "snapshot_url": snapshot_url,
-            "video_url": video_url,
-        }
-        alert_details = {
-            "Incident ID": incident.incident_id,
-            "Alert Category": incident.metadata.get("category", "Unknown Alert"),
-        }
-        info = incident.metadata.get("info", {})
+    try:
+        await _fetch_media(incident.sensor_id)
+    except Exception as e:
+        media_error = f"Video/snapshot unavailable for stream '{incident.sensor_id}': {e!s}"
+        camera = None
+        if camera_picker is not None and object_ids:
+            try:
+                camera = await camera_picker.pick(
+                    object_ids, incident.start_timestamp, incident.end_timestamp, info.get("primaryObjectId")
+                )
+                if camera:
+                    # Bounded: VST renders overlay clips, and a burst of parallel
+                    # requests times out on smaller hosts.
+                    async with camera_picker.media_slots:
+                        await _fetch_media(camera)
+                    clip_info["Camera"] = camera
+                    media_error = ""
+            except Exception as pick_error:
+                media_error += f"; camera fallback ({camera or 'none'}) failed: {pick_error!r}"
+        if media_error:
+            logger.warning(f"Incident {incident.incident_id}: {media_error}")
+            alert_details["Media Note"] = media_error
+
+    try:
         verification_code = info.get("verificationResponseCode", info.get("verification_response_code"))
         # Only use verification fields if verification code is 200
         if verification_code == "200" or verification_code == 200:
@@ -297,22 +362,55 @@ async def _format_single_incident(
 
     except Exception as e:
         logger.error(f"Error formatting incident {incident.incident_id}: {e}")
-        # Return a basic error structure
+        alert_details["Alert Description"] = f"Failed to retrieve full details - {e!s}"
         return {
             "Alert Title": f"Alert Triggered {incident_number}",
-            "Clip Information": {
-                "Timestamp": incident.start_timestamp,
-                "Stream": incident.sensor_id,
-                "snapshot_url": "Error",
-                "video_url": "Error",
-            },
-            "Alert Details": {
-                "Incident ID": incident.incident_id,
-                "Alert Triggered": "Error",
-                "Validation": False,
-                "Alert Description": f"Failed to retrieve full details - {e!s}",
-            },
+            "Clip Information": clip_info,
+            "Alert Details": alert_details,
         }
+
+
+def _merge_ids(object_ids: list[Any], aliases: dict[str, str] | None) -> tuple[list[str], dict[str, list[str]]]:
+    """Map IDs to their canonical person; return (deduplicated IDs, canonical -> merged aliases)."""
+    canonical: list[str] = []
+    merged: dict[str, list[str]] = {}
+    for raw in object_ids:
+        obj_id = str(raw)
+        target = (aliases or {}).get(obj_id, obj_id)
+        if target not in canonical:
+            canonical.append(target)
+        if target != obj_id:
+            merged.setdefault(target, []).append(obj_id)
+    return canonical, merged
+
+
+async def _summarize_all_incidents(
+    incidents: list[IncidentData],
+    camera_picker: BevCameraPicker | None,
+    aliases: dict[str, str] | None = None,
+    max_items: int = 500,
+) -> list[str]:
+    """One compact line per incident: "start..end category: Type#id, Type#id" (duplicate IDs merged)."""
+    shown = incidents[:max_items]
+    types: dict[str, str] = {}
+    if camera_picker is not None:
+        all_ids = sorted({i for inc in shown for i in _merge_ids(inc.metadata.get("objectIds") or [], aliases)[0]})
+        starts = [inc.start_timestamp for inc in shown if inc.start_timestamp]
+        ends = [inc.end_timestamp for inc in shown if inc.end_timestamp]
+        if all_ids and starts and ends:
+            try:
+                types = await camera_picker.object_types(all_ids, min(starts), max(ends))
+            except Exception as e:
+                logger.warning(f"Object type lookup for incident summary failed: {e!r}")
+    lines = []
+    for inc in shown:
+        ids, _ = _merge_ids(inc.metadata.get("objectIds") or [], aliases)
+        objects = ", ".join(f"{types[i]}#{i}" if i in types else f"#{i}" for i in ids)
+        category = inc.metadata.get("category") or "Incident"
+        lines.append(f"{inc.start_timestamp}..{inc.end_timestamp} {category}: {objects}")
+    if len(incidents) > max_items:
+        lines.append(f"... {len(incidents) - max_items} older incidents omitted")
+    return lines
 
 
 async def _generate_incidents_chart(
@@ -557,6 +655,7 @@ async def _multi_incident_formatter_impl(
     generate_chart: bool = False,
     chart_base_url: str | None = None,
     display_limit: int = 20,
+    camera_picker: BevCameraPicker | None = None,
 ) -> MultiIncidentFormatterOutput:
     """
     Fetch and format multiple incidents in parallel.
@@ -593,6 +692,21 @@ async def _multi_incident_formatter_impl(
         # Step 2: Take only top N incidents for formatting (display_limit from input)
         incidents_to_format = incidents[:display_limit]
 
+        # One physical person can carry several tracking IDs (e.g. at a looped
+        # video's seam); merge IDs that move together so answers count people.
+        aliases: dict[str, str] = {}
+        if camera_picker is not None:
+            try:
+                aliases = await camera_picker.person_aliases(
+                    [
+                        (inc.start_timestamp, inc.end_timestamp, [str(i) for i in inc.metadata.get("objectIds") or []])
+                        for inc in incidents[:500]
+                        if len(inc.metadata.get("objectIds") or []) >= 2
+                    ]
+                )
+            except Exception as e:
+                logger.warning(f"Duplicate person detection failed: {e!r}")
+
         logger.info(f"Formatting {len(incidents_to_format)} incidents in parallel")
 
         # Step 3: Format selected incidents in parallel
@@ -602,17 +716,36 @@ async def _multi_incident_formatter_impl(
                 video_url_tool,
                 picture_url_tool,
                 incident_number=i + 1,
+                camera_picker=camera_picker,
+                aliases=aliases,
             )
             for i, incident in enumerate(incidents_to_format)
         ]
         formatted_results = await asyncio.gather(*tasks)
 
         # Step 4: Build the final JSON structure with <incidents> tags
-        incidents_json = {
+        incidents_json: dict[str, Any] = {
             "incidents": formatted_results,
             "total_incidents": len(incidents),
             "displayed_incidents": len(formatted_results),
         }
+        if aliases:
+            incidents_json["person_id_merges"] = aliases
+            incidents_json["merge_note"] = (
+                "Person IDs in 'person_id_merges' (alias -> kept ID) are the same physical person (they moved "
+                "within 0.5 m of each other, or one track took over where the other ended). Incidents already "
+                "use the kept ID; count people by it. Remaining distinct Person IDs may still be one person "
+                "re-identified later (no overlap in time), so say the person count is an upper bound."
+            )
+        if len(incidents) > len(formatted_results):
+            # Without this the LLM sees "20 of N" and paginates with narrower
+            # windows until it hits the recursion limit.
+            incidents_json["all_incidents_summary"] = await _summarize_all_incidents(incidents, camera_picker, aliases)
+            incidents_json["summary_note"] = (
+                f"'incidents' has full details (media) for the {len(formatted_results)} most recent; "
+                f"'all_incidents_summary' lists ALL {len(incidents)} incidents. The data is complete: "
+                "do not re-query or paginate."
+            )
 
         json_string = json.dumps(incidents_json, indent=2)
         formatted_output = f"\n<incidents>\n{json_string}\n</incidents>"
@@ -685,11 +818,19 @@ async def multi_incident_formatter(
             config.generate_chart,
             config.chart_base_url,
             config.display_limit,
+            camera_picker,
         )
 
-    yield FunctionInfo.create(
-        single_fn=_multi_incident_formatter,
-        description=_multi_incident_formatter_impl.__doc__,
-        input_schema=MultiIncidentFormatterInput,
-        single_output_schema=MultiIncidentFormatterOutput,
+    camera_picker = (
+        BevCameraPicker(config.bev_camera_es_url, config.bev_camera_raw_index) if config.bev_camera_es_url else None
     )
+    try:
+        yield FunctionInfo.create(
+            single_fn=_multi_incident_formatter,
+            description=_multi_incident_formatter_impl.__doc__,
+            input_schema=MultiIncidentFormatterInput,
+            single_output_schema=MultiIncidentFormatterOutput,
+        )
+    finally:
+        if camera_picker is not None:
+            await camera_picker.close()
