@@ -1,0 +1,11 @@
+# Cap VST recordings for this build at ~20 GB (stock services/vios/configs/
+# vst_storage.json allows 100 GB, shared by every profile). Mounted as a single
+# file over the configs directory mount, so only this build changes.
+# 4 cameras record ~6 GB/hour here, so 20 GB keeps roughly the last 3 hours.
+services:
+  sensor-ms-mv3dt:            # container vss-vios-sensor
+    volumes:
+      - ${VSS_APPS_DIR}/../../_builds/warehouse-mv3dt-kafka/vst_storage.json:/home/vst/vst_release/configs/vst_storage.json:ro
+  streamprocessing-ms-mv3dt:  # container vss-vios-streamprocessing
+    volumes:
+      - ${VSS_APPS_DIR}/../../_builds/warehouse-mv3dt-kafka/vst_storage.json:/home/vst/vst_release/configs/vst_storage.json:ro

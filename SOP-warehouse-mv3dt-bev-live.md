@@ -27,7 +27,7 @@ NvStreamer(4 支 mp4) ─RTSP→ VST(VIOS) ─RTSP→ RT-CV MV3DT ─mdx-raw→ 
 | 路徑 | 內容 |
 |---|---|
 | [`apps/bev-live/`](apps/bev-live/) | BEV Live 對照網站（`server.py`、`index.html`、`map.png`、`transforms.yml`） |
-| [`_builds/warehouse-mv3dt-kafka/`](_builds/warehouse-mv3dt-kafka/) | 這次部署的 build layer：`override.env`、`compose.yml`、`agent-patches.yml`、`reset.sh`（**不含**金鑰；`resolved.yml` / `configurator.env` / `secrets.env` 是部署時產生或本機私有、已被 `.gitignore` 排除） |
+| [`_builds/warehouse-mv3dt-kafka/`](_builds/warehouse-mv3dt-kafka/) | 這次部署的 build layer：`override.env`、`compose.yml`、`agent-patches.yml`、`vst-storage.yml` ＋ `vst_storage.json`（VST 錄影上限 20 GB）、`reset.sh`（**不含**金鑰；`resolved.yml` / `configurator.env` / `secrets.env` 是部署時產生或本機私有、已被 `.gitignore` 排除） |
 | `services/agent/packages/vss_agents/src/vss_agents/tools/` | Agent 修改：`multi_incident_formatter.py`、新增 `bev_camera_picker.py`（§7.4） |
 | `warehouse-operations/vss-agent/configs/config.yml`、`warehouse-mv3dt-app/vss-behavior-analytics/configs/vss-behavior-analytics-config.json` | 開啟碰撞（靠近）事件、Agent 提示與攝影機挑選（§7.2） |
 | `deploy/docker/industry-profiles/warehouse-operations/overrides.env` | 本機設定：`HOST_IP`、`VSS_APPS_DIR`、`VSS_DATA_DIR`、`HARDWARE_PROFILE=IGX-THOR`、`PROMETHEUS_HOST_PORT=19090` 等 |
@@ -298,12 +298,13 @@ ls ~/bev-output/fused_trajectory_video_*.mp4
 - 右：4 路 VST 即時畫面（2×2），點一下放大。
 - 滑過某個攝影機畫面時，BEV 上對應的攝影機標記會亮綠閃爍。
 - 狀態列：連線狀態、BEV FPS、追蹤人數、延遲；控制：軌跡長度 5–120 s、ID／攝影機位置開關、暫停、清除。
+- **碰撞通知**：`mdx-incidents` 出現 Proximity Violation 時，右上角跳出「⚠ 碰撞警告」（時間、機器人與哪些人距離過近），BEV 上相關的機器人與人加上紅色脈衝圈並以虛線連到主物件，**5 秒後消失**（`index.html` 的 `HIGHLIGHT_MS`）。
 
 ### 6.2 架構
 
 | 元件 | 說明 |
 |---|---|
-| `server.py` | Python 標準庫 HTTP server。Kafka `mdx-bev`（protobuf，用 rt-cv-mv3dt 的 `schema_pb2`）→ `/events`（SSE，約 30 FPS）；VST RTSP → `/cam/<name>`（MJPEG，640 寬、15 FPS，沒人看 10 秒後自動停止解碼）；`/config.json` 提供地圖尺寸、`T_ov2px` 與 calibration 裡的攝影機座標 |
+| `server.py` | Python 標準庫 HTTP server。Kafka `mdx-bev`（protobuf，用 rt-cv-mv3dt 的 `schema_pb2`）→ `/events`（SSE，約 30 FPS）；VST RTSP → `/cam/<name>`（MJPEG，640 寬、15 FPS，沒人看 10 秒後自動停止解碼）；`/config.json` 提供地圖尺寸、`T_ov2px` 與 calibration 裡的攝影機座標，**每次被讀取時重新向 VST 查攝影機**（網址變了就換新）；Kafka `mdx-incidents`（protobuf `nv.Incident`，內建最小解碼器）→ `/events` 的 `event: incident`，同一事件只送一次 |
 | `index.html` | 單檔前端，canvas 畫軌跡，`<img>` 播 MJPEG，無外部相依 |
 | `map.png` / `transforms.yml` | §5.1 產生的底圖與世界座標→像素矩陣 |
 
@@ -318,7 +319,7 @@ services/rtvi/rt-cv-3d/rt-cv-mv3dt/utils/venv/bin/python apps/bev-live/server.py
 # 瀏覽器打開 http://<HOST_IP>:8091
 ```
 
-參數：`--topic`（預設 `mdx-bev`）、`--calibration`（預設 repo 內 4cams-20mx20m-synthetic）、`--cam-width`、`--cam-fps`。
+參數：`--topic`（預設 `mdx-bev`）、`--incident-topic`（預設 `mdx-incidents`）、`--calibration`（預設 repo 內 4cams-20mx20m-synthetic）、`--cam-width`、`--cam-fps`。
 
 背景常駐（可選）：
 
@@ -336,7 +337,9 @@ curl -sN -m 2 http://127.0.0.1:8091/events | head -c 200                        
 
 ### 6.5 注意
 
-- warehouse stack 重新部署後 VST 的 sensor ID 會變；**重啟 server** 即可（啟動時會重新向 VST 查詢）。
+- warehouse stack 重新部署後 VST 的 sensor ID 與 RTSP 網址會變；**重新整理網頁**即可（`/config.json` 會重新查 VST），不必重啟 server。
+- 同一個瀏覽器對 8091 最多 6 條連線，一頁就佔 5 條（SSE ＋ 4 路 MJPEG）；**同時開兩個 8091 分頁會卡住**，只留一個。
+- VST 轉出的 H.264 每幀帶一段長度多算 1 byte 的 SEI，FFmpeg 會逐幀印 `SEI type 5 size 1040 truncated at 1039`（無害）；`server.py` 預設 `OPENCV_FFMPEG_LOGLEVEL=8` 把它關掉，排查影像問題時可自行設成 `16` / `24`。
 - 攝影機畫面（VST live）與 BEV（RT-CV → bev-fusion 處理後）之間可能差零點幾秒。
 - 攝影機標記位置取自 `calibration.json` 的 `coordinates` 欄位；目前看起來是攝影機在地面上的位置，但官方文件未明確定義。
 - 目前軌跡包含 Person 與兩種人形機器人（Agility Digit、Fourier GR1）。Transporter / Pallet 在 `ds-pgie-config.yml` 的 `filter-out-class-ids: 4;6` 被過濾掉。
@@ -453,7 +456,7 @@ bash _builds/warehouse-mv3dt-kafka/reset.sh up        # 重新產生 resolved.ym
 bash _builds/warehouse-mv3dt-kafka/reset.sh status    # 看容器 / VST sensor / RT-CV 狀態
 ```
 
-全新部署約需 10–15 分鐘才會接上 4 路串流。BEV Live 網站要另外啟動（`up` 結束時會印出指令）。`up` 會讀取 `secrets.env` 裡的 `OPENAI_API_KEY`（§7.3）；`up` 若因健康檢查逾時失敗兩次，等負載下降後再執行 `docker compose -f _builds/warehouse-mv3dt-kafka/resolved.yml up -d` 即可。
+全新部署約需 10–15 分鐘才會接上 4 路串流。VST 錄影上限由 `vst-storage.yml` 掛入的 `vst_storage.json` 設為 20 GB（上游預設 100 GB），重置後生效，可用 `docker exec vss-vios-streamprocessing cat /home/vst/vst_release/configs/vst_storage.json` 確認。BEV Live 網站要另外啟動（`up` 結束時會印出指令）。`up` 會讀取 `secrets.env` 裡的 `OPENAI_API_KEY`（§7.3）；`up` 若因健康檢查逾時失敗兩次，等負載下降後再執行 `docker compose -f _builds/warehouse-mv3dt-kafka/resolved.yml up -d` 即可。
 
 > **不要用 `docker compose stop` / `start` 暫停再接續。** 實測（2026-11-11）：`stop` 後再 `start`，VST 資料庫裡
 > 前一次的 sensor 全部變成 offline，configurator 重新註冊又被 `found existing sensor with same name` 擋掉，
@@ -504,6 +507,9 @@ docker volume inspect -f '{{index .Options "device"}}' vss_kafka-data 2>/dev/nul
 | 15 | Agent 說某台機器人和很多不同的 Person ID 碰撞，但現場只有一個人 | 4 支影片都是 300 秒循環播放，每輪接縫人會瞬間跳回起點，追蹤器配新 ID；部署跑越久，假 ID 越不會消失，成為貼在真人旁邊（< 0.3 m）的分身 | Agent 已合併同時存在的分身與接力換號（§7.4）。循環後才重新出現、時間上沒重疊的 ID 無法靠位置合併（需要 ReID），根本解法是改用不循環的影片 / 真實攝影機，或定期 `reset.sh` |
 | 16 | Agent 回 `Sorry, I wasn't able to complete your request`，Phoenix / 中間步驟顯示 `Recursion limit of 15 reached` | LLM 反覆重查事件：想用 VLM 驗證是否「真的碰撞」，或看到「20 / N 筆」想分頁補齊 | 已在 `config.yml` 提示與 formatter 的 `all_incidents_summary` 修正（§7.4）。若再發生，先到 Phoenix 看它在重查什麼 |
 | 17 | Agent 說 `bev-sensor-1` 不存在，要你改選 Camera，結果 0 筆 | Agent 拿 VST 的攝影機清單去「驗證」sensor，裡面沒有 `bev-sensor-1` | 已在提示中註明 `bev-sensor-1` 是合法的事件來源（§7.1）；問題裡直接寫出 `bev-sensor-1` |
+| 18 | `reset.sh` 跑完後 8091 右側攝影機一片黑，`/config.json` 的 `cameras` 是 `[]` | BEV Live server 在重置期間就在跑，當時 VST 還沒有 sensor | 重新整理網頁（現已每次載入都重查 VST，§6.5） |
+| 19 | `reset.sh` 卡很久，`sensor-bp-wait-bp-configurator` Exited(1) `timeout` | 負載高時 `vss-kafka-topics` 建 topic 約 3 分鐘、`broker-health-check` 逐一檢查 22 個 topic 又數分鐘，configurator 晚於 300 秒等待上限才起來 | 通常 compose 之後仍會把 VIOS sensor 帶起來；若沒有，等 `vss-configurator-mv3dt` healthy 後再 `docker compose -f resolved.yml up -d` |
+| 20 | `apps/bev-live/server.log` 每小時長 25 MB 以上，全是 `SEI type 5 ... truncated` | 見 §6.5 | 已預設關閉；舊 log 可直接 `: > apps/bev-live/server.log` |
 
 ### 寫入 repo 的副作用
 

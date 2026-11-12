@@ -3,3 +3,4 @@ include:
       - ../../deploy/docker/compose.yml
       - ../../deploy/docker/services/infra/compose-no-turn-tcp-relay.yml
       - ./agent-patches.yml
+      - ./vst-storage.yml
