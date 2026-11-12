@@ -33,13 +33,14 @@
   button:hover { border-color: var(--muted); }
   button.on { border-color: var(--warn); color: var(--warn); }
   main { flex: 1; min-height: 0; display: grid; gap: 12px; padding: 12px;
-    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+    grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr); }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
     min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
   .panel-title { padding: 8px 12px; color: var(--muted); font-size: 12px;
     border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
   #bevWrap { position: relative; flex: 1; min-height: 0; }
-  #bev { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #bev { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+  #bev.drag { cursor: grabbing; }
   #tip { position: absolute; pointer-events: none; background: rgba(13,17,23,.92);
     border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12px;
     display: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -54,6 +55,19 @@
   #cams.focus { grid-template-columns: 1fr; }
   #cams.focus .cam { display: none; }
   #cams.focus .cam.big { display: block; cursor: zoom-out; }
+  /* 碰撞通知：右上角，5 秒後淡出（與 HIGHLIGHT_MS 一致） */
+  #toasts { position: fixed; top: 64px; right: 16px; z-index: 50; display: flex; flex-direction: column;
+    gap: 8px; width: min(360px, calc(100vw - 32px)); pointer-events: none; }
+  .toast { background: #2a1214; border: 1px solid var(--bad); border-left: 4px solid var(--bad);
+    border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.45);
+    animation: toastIn .18s ease-out, toastOut .4s ease-in 4.6s forwards; }
+  .toast .t-title { color: var(--bad); font-weight: 700; display: flex; justify-content: space-between; gap: 8px; }
+  .toast .t-title span { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+  .toast .t-body { margin-top: 4px; }
+  .toast .t-body b { font-weight: 600; }
+  @keyframes toastIn { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
+  @keyframes toastOut { to { opacity: 0; transform: translateX(16px); } }
+  @media (prefers-reduced-motion: reduce) { .toast { animation: toastOut .01s linear 4.99s forwards; } }
   @media (max-width: 900px) {
     main { grid-template-columns: 1fr; grid-template-rows: minmax(320px, 55vh) auto; }
     #cams { grid-auto-rows: 28vw; }
@@ -80,9 +94,10 @@
     <button id="clear">清除軌跡</button>
   </div>
 </header>
+<div id="toasts" role="status" aria-live="polite"></div>
 <main>
   <section class="panel">
-    <div class="panel-title"><span>Bird-Eye View（mdx-bev）</span><span>滑過軌跡頭可看座標</span></div>
+    <div class="panel-title"><span>Bird-Eye View（mdx-bev）</span><span>滾輪縮放 · 拖曳平移 · 雙擊重置 · 滑過軌跡頭可看座標</span></div>
     <div id="bevWrap"><canvas id="bev"></canvas><div id="tip"></div></div>
   </section>
   <section class="panel">
@@ -95,9 +110,24 @@ const $ = id => document.getElementById(id);
 const canvas = $("bev"), ctx = canvas.getContext("2d"), tip = $("tip");
 const mapImg = new Image(); mapImg.src = "/map.png";
 let cfg = null, view = { s: 1, ox: 0, oy: 0 };
+let crop = null, zoom = 1, pan = [0, 0];   // crop: 地圖實際內容範圍（去掉兩側灰邊）
+mapImg.onload = () => {
+  const w = mapImg.naturalWidth, h = mapImg.naturalHeight, c = document.createElement("canvas");
+  c.width = w; c.height = h; const g = c.getContext("2d"); g.drawImage(mapImg, 0, 0);
+  const d = g.getImageData(0, 0, w, h).data, bg = [d[0], d[1], d[2]];
+  const isBg = i => Math.abs(d[i] - bg[0]) + Math.abs(d[i + 1] - bg[1]) + Math.abs(d[i + 2] - bg[2]) < 12;
+  const colBg = x => { for (let y = 0; y < h; y += 4) if (!isBg((y * w + x) * 4)) return false; return true; };
+  const rowBg = y => { for (let x = 0; x < w; x += 4) if (!isBg((y * w + x) * 4)) return false; return true; };
+  let x0 = 0, x1 = w - 1, y0 = 0, y1 = h - 1;
+  while (x0 < x1 && colBg(x0)) x0++; while (x1 > x0 && colBg(x1)) x1--;
+  while (y0 < y1 && rowBg(y0)) y0++; while (y1 > y0 && rowBg(y1)) y1--;
+  crop = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 }; resize();
+};
 const tracks = new Map();          // id -> {pts:[[t,x,y]], last:t}
 let latestT = 0, paused = false, hoverCam = null, hoverId = null;
 let frameCount = 0, lastMsgAt = 0;
+const HIGHLIGHT_MS = 5000;
+const alerts = [];                 // 碰撞高亮：{ids, primary, until}
 
 const color = id => `hsl(${(parseInt(id, 10) * 137.508) % 360} 85% 60%)`;
 // 類別 → 分組（計數）與標記形狀
@@ -122,9 +152,10 @@ function resize() {
   canvas.width = r.width * dpr; canvas.height = r.height * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   if (cfg) {
-    view.s = Math.min(r.width / cfg.map.w, r.height / cfg.map.h);
-    view.ox = (r.width - cfg.map.w * view.s) / 2;
-    view.oy = (r.height - cfg.map.h * view.s) / 2;
+    const c = crop || { x: 0, y: 0, w: cfg.map.w, h: cfg.map.h };
+    view.s = Math.min(r.width / c.w, r.height / c.h) * zoom;
+    view.ox = (r.width - c.w * view.s) / 2 - c.x * view.s + pan[0];
+    view.oy = (r.height - c.h * view.s) / 2 - c.y * view.s + pan[1];
   }
 }
 new ResizeObserver(resize).observe($("bevWrap"));
@@ -145,7 +176,7 @@ function draw() {
   if (!cfg) return;
   const r = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, r.width, r.height);
-  if (mapImg.complete) ctx.drawImage(mapImg, view.ox, view.oy, cfg.map.w * view.s, cfg.map.h * view.s);
+  if (mapImg.complete) ctx.drawImage(mapImg, view.ox, view.oy, cfg.map.w * view.s, cfg.map.h * view.s);  // 整張畫，crop 只影響置中與比例
 
   const trailMs = $("trail").value * 1000, cutoff = latestT - trailMs;
   const counts = { person: 0, robot: 0, cart: 0, other: 0 };
@@ -176,6 +207,7 @@ function draw() {
     }
   }
   draw.heads = heads;
+  drawAlerts(heads);
 
   if ($("showCams").checked) for (const cam of cfg.cameras) {
     if (cam.x == null) continue;
@@ -192,6 +224,51 @@ function draw() {
   $("cCart").textContent = counts.cart;
 }
 
+// 碰撞高亮：當事的機器人與人加紅色閃爍圈，並以虛線連到主要物件（機器人），5 秒後消失
+function drawAlerts(heads) {
+  const now = performance.now();
+  for (let i = alerts.length - 1; i >= 0; i--) if (alerts[i].until < now) alerts.splice(i, 1);
+  if (!alerts.length) return;
+  const pos = new Map(heads.map(h => [h.id, h]));
+  const pulse = 0.5 + 0.5 * Math.sin(now / 120);
+  for (const a of alerts) {
+    const p0 = pos.get(a.primary);
+    ctx.save();
+    ctx.strokeStyle = "#f85149"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    if (p0) for (const id of a.ids) {
+      const p = pos.get(id);
+      if (!p || id === a.primary) continue;
+      ctx.beginPath(); ctx.moveTo(p0.px, p0.py); ctx.lineTo(p.px, p.py); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    for (const id of a.ids) {
+      const p = pos.get(id);
+      if (!p) continue;
+      ctx.globalAlpha = 0.25 + 0.35 * pulse; ctx.fillStyle = "#f85149";
+      ctx.beginPath(); ctx.arc(p.px, p.py, 14 + 4 * pulse, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(p.px, p.py, 14 + 4 * pulse, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+const nameOf = (id, type) => `${TYPE_ZH[type] || type || "物件"} #${id}`;
+function onIncident(inc) {
+  if (paused || !inc.ids || !inc.ids.length) return;
+  const [primary, ...others] = inc.ids;
+  alerts.push({ ids: inc.ids, primary, until: performance.now() + HIGHLIGHT_MS });
+  const typeOf = id => inc.types?.[id] || tracks.get(id)?.type || "";
+  const el = document.createElement("div");
+  el.className = "toast";
+  const time = new Date(inc.start).toLocaleTimeString("zh-TW", { hour12: false });
+  el.innerHTML = `<div class="t-title">⚠ 碰撞警告<span>${time}</span></div>
+    <div class="t-body"><b>${nameOf(primary, typeOf(primary))}</b> 與
+    <b>${others.map(id => nameOf(id, typeOf(id))).join("、") || "?"}</b> 距離過近</div>`;
+  $("toasts").prepend(el);
+  setTimeout(() => el.remove(), HIGHLIGHT_MS);
+}
+
 canvas.addEventListener("mousemove", e => {
   const r = canvas.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
   let best = null, bd = 18 * 18;
@@ -203,6 +280,21 @@ canvas.addEventListener("mousemove", e => {
   } else tip.style.display = "none";
 });
 canvas.addEventListener("mouseleave", () => { hoverId = null; tip.style.display = "none"; });
+// 縮放／平移：以游標為中心縮放，拖曳平移，雙擊重置
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const nz = Math.min(8, Math.max(1, zoom * Math.exp(-e.deltaY * 0.0015))), k = nz / zoom;
+  // 讓游標下的點保持不動：新 offset = m - (m - o) * k，再換算回 pan
+  const cx = r.width / 2, cy = r.height / 2;
+  pan = [(mx - cx) - ((mx - cx) - pan[0]) * k, (my - cy) - ((my - cy) - pan[1]) * k];
+  zoom = nz; if (zoom === 1) pan = [0, 0]; resize();
+}, { passive: false });
+let dragFrom = null;
+canvas.addEventListener("pointerdown", e => { dragFrom = [e.clientX - pan[0], e.clientY - pan[1]]; canvas.setPointerCapture(e.pointerId); canvas.classList.add("drag"); });
+canvas.addEventListener("pointermove", e => { if (dragFrom) { pan = [e.clientX - dragFrom[0], e.clientY - dragFrom[1]]; resize(); } });
+canvas.addEventListener("pointerup", () => { dragFrom = null; canvas.classList.remove("drag"); });
+canvas.addEventListener("dblclick", () => { zoom = 1; pan = [0, 0]; resize(); });
 
 $("trail").oninput = e => $("trailVal").textContent = e.target.value;
 $("pause").onclick = e => { paused = !paused; e.target.textContent = paused ? "繼續" : "暫停"; e.target.classList.toggle("on", paused); };
@@ -237,6 +329,7 @@ fetch("/config.json").then(r => r.json()).then(c => {
   }
   const es = new EventSource("/events");
   es.onmessage = e => onFrame(JSON.parse(e.data));
+  es.addEventListener("incident", e => onIncident(JSON.parse(e.data)));
   requestAnimationFrame(draw);
 });
 </script>

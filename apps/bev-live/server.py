@@ -6,7 +6,8 @@
     services/rtvi/rt-cv-3d/rt-cv-mv3dt/utils/venv/bin/python apps/bev-live/server.py \
         --kafka <HOST_IP>:<KAFKA_HOST_PORT> --vst http://<HOST_IP>:7777
 
-- /events      SSE：mdx-bev 每一幀 {t, o:[[id,x,y],...]}
+- /events      SSE：mdx-bev 每一幀 {t, o:[[id,x,y,type],...]}；
+               碰撞（Proximity Violation）事件以 `event: incident` 推送 {start, ids, types, category}
 - /cam/<name>  MJPEG：從 VST 拉 RTSP，降解析度後轉送（沒人看時自動停）
 - /config.json 地圖尺寸、T_ov2px、攝影機位置
 """
@@ -14,7 +15,10 @@ import argparse, json, os, queue, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import cv2, yaml
+# VST 轉出的 H.264 每幀都帶一段長度欄位多算 1 byte 的 SEI，FFmpeg 會以 ERROR 等級逐幀抱怨
+# （"SEI type 5 size 1040 truncated at 1039"），畫面其實解碼正常；只留 FATAL 以免 log 爆量。
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
+import cv2, yaml  # noqa: E402
 from confluent_kafka import Consumer
 
 HERE = Path(__file__).resolve().parent
@@ -26,6 +30,7 @@ from schema_pb2 import Frame  # noqa: E402
 p = argparse.ArgumentParser()
 p.add_argument("--kafka", default="172.22.12.205:29192")
 p.add_argument("--topic", default="mdx-bev")
+p.add_argument("--incident-topic", default="mdx-incidents")
 p.add_argument("--vst", default="http://172.22.12.205:7777")
 p.add_argument("--calibration", default=str(REPO / "deploy/docker/industry-profiles/warehouse-operations/warehouse-mv3dt-app/calibration/sample-data/warehouse-4cams-20mx20m-synthetic/calibration.json"))
 p.add_argument("--port", type=int, default=8091)
@@ -66,6 +71,19 @@ def resolve_rtsp():
 # ---------- Kafka -> SSE ----------
 clients, clients_lock = set(), threading.Lock()
 stats = {"frames": 0, "last_t": 0}
+last_type = {}  # object id -> 最近一次在 mdx-bev 看到的類別（給碰撞通知用）
+
+
+def broadcast(message):
+    """把一則完整的 SSE 訊息丟給所有連線；佇列滿時丟掉最舊的。"""
+    with clients_lock:
+        for q in clients:
+            if q.full():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+            q.put_nowait(message)
 
 
 def kafka_loop():
@@ -94,14 +112,104 @@ def kafka_loop():
                              separators=(",", ":"))
         stats["frames"] += 1
         stats["last_t"] = t
-        with clients_lock:
-            for q in clients:
-                if q.full():
-                    try:
-                        q.get_nowait()
-                    except queue.Empty:
-                        pass
-                q.put_nowait(payload)
+        for o in f.objects:
+            if o.type:
+                last_type[o.id] = o.type
+        broadcast(f"data: {payload}\n\n")
+
+
+# ---------- mdx-incidents（nv.Incident protobuf）-> SSE ----------
+def _varint(buf, i):
+    shift = val = 0
+    while True:
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if b < 0x80:
+            return val, i
+        shift += 7
+
+
+def _fields(buf):
+    """極簡 protobuf 解碼：逐一產生 (field_number, wire_type, value)。"""
+    i = 0
+    while i < len(buf):
+        key, i = _varint(buf, i)
+        num, wt = key >> 3, key & 7
+        if wt == 0:
+            val, i = _varint(buf, i)
+        elif wt == 2:
+            n, i = _varint(buf, i)
+            val, i = buf[i:i + n], i + n
+        elif wt == 1:
+            val, i = buf[i:i + 8], i + 8
+        elif wt == 5:
+            val, i = buf[i:i + 4], i + 4
+        else:
+            raise ValueError(f"wire type {wt}")
+        yield num, wt, val
+
+
+def _timestamp_ms(buf):
+    sec = nanos = 0
+    for num, _, val in _fields(buf):
+        if num == 1:
+            sec = val
+        elif num == 2:
+            nanos = val
+    return sec * 1000 + nanos // 1_000_000
+
+
+def parse_incident(buf):
+    """nv.Incident 只取需要的欄位：1 sensorId、2 timestamp、3 end、4 objectIds、8 category、11 info。"""
+    inc = {"sensor": "", "start": 0, "end": 0, "ids": [], "category": "", "info": {}}
+    for num, wt, val in _fields(buf):
+        if wt != 2:
+            continue
+        if num == 1:
+            inc["sensor"] = val.decode()
+        elif num == 2:
+            inc["start"] = _timestamp_ms(val)
+        elif num == 3:
+            inc["end"] = _timestamp_ms(val)
+        elif num == 4:
+            inc["ids"].append(val.decode())
+        elif num == 8:
+            inc["category"] = val.decode()
+        elif num == 11:
+            entry = {n: v.decode() for n, w, v in _fields(val) if w == 2}
+            inc["info"][entry.get(1, "")] = entry.get(2, "")
+    return inc
+
+
+def incident_loop():
+    """每個事件只通知一次：行為分析在事件持續期間會重複送出更新，用（開始時間, 主要物件）去重。"""
+    c = Consumer({"bootstrap.servers": args.kafka, "group.id": f"bev-live-inc-{os.getpid()}",
+                  "auto.offset.reset": "latest", "enable.auto.commit": False})
+    c.subscribe([args.incident_topic])
+    seen = {}
+    while True:
+        m = c.poll(0.5)
+        if m is None or m.error():
+            continue
+        try:
+            inc = parse_incident(m.value())
+        except Exception:
+            continue
+        if not inc["ids"]:
+            continue
+        key = (inc["sensor"], inc["start"], inc["ids"][0])
+        now = time.time()
+        if key in seen:
+            continue
+        seen[key] = now
+        for k in [k for k, t in seen.items() if now - t > 600]:
+            del seen[k]
+        stats["incidents"] = stats.get("incidents", 0) + 1
+        event = {"start": inc["start"], "ids": inc["ids"], "category": inc["category"],
+                 "types": {i: last_type.get(i, "") for i in inc["ids"]}}
+        print(f"incident {inc['category']} {event['types']}", flush=True)
+        broadcast(f"event: incident\ndata: {json.dumps(event, separators=(',', ':'))}\n\n")
 
 
 # ---------- RTSP -> MJPEG ----------
@@ -147,6 +255,21 @@ class Camera:
 
 
 cameras = {}
+cameras_lock = threading.Lock()
+
+
+def refresh_cameras():
+    """重新向 VST 查攝影機。reset 後 sensorId/RTSP 網址會變，VST 剛起來時清單也可能是空的。"""
+    try:
+        found = resolve_rtsp()
+    except Exception as e:
+        print(f"VST 查詢失敗：{e}", flush=True)
+        return
+    with cameras_lock:
+        for name, url in found.items():
+            if name not in cameras or cameras[name].url != url:
+                cameras[name] = Camera(name, url)
+                print(f"camera {name}: {url}", flush=True)
 
 
 # ---------- HTTP ----------
@@ -171,6 +294,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/map.png":
             return self.send_bytes((HERE / "map.png").read_bytes(), "image/png", "max-age=3600")
         if path == "/config.json":
+            refresh_cameras()
             cfg = {"map": {"w": mw, "h": mh}, "T": T,
                    "cameras": [{"name": n, **cams_cal.get(n, {})} for n in cameras]}
             return self.send_bytes(json.dumps(cfg).encode(), "application/json")
@@ -192,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 try:
-                    self.wfile.write(f"data: {q.get(timeout=10)}\n\n".encode())
+                    self.wfile.write(q.get(timeout=10).encode())
                 except queue.Empty:
                     self.wfile.write(b": ping\n\n")
                 self.wfile.flush()
@@ -227,11 +351,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    for name, url in resolve_rtsp().items():
-        cameras[name] = Camera(name, url)
-        print(f"camera {name}: {url}", flush=True)
+    refresh_cameras()
     threading.Thread(target=kafka_loop, daemon=True).start()
-    print(f"kafka {args.kafka} topic {args.topic}", flush=True)
+    threading.Thread(target=incident_loop, daemon=True).start()
+    print(f"kafka {args.kafka} topics {args.topic}, {args.incident_topic}", flush=True)
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     srv.daemon_threads = True
     print(f"BEV Live: http://0.0.0.0:{args.port}/", flush=True)
