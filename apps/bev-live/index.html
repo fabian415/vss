@@ -41,7 +41,15 @@
   #bevWrap { position: relative; flex: 1; min-height: 0; }
   #bev { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
   #bev.drag { cursor: grabbing; }
-  #tip { position: absolute; pointer-events: none; background: rgba(13,17,23,.92);
+  .view3d { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+  .labels3d { pointer-events: none; }
+  #bevWrap.is3d #bev { display: none; }
+  #bevWrap.is3d .view3d { display: block; }
+  .lbl { font: 600 12px system-ui; text-shadow: 0 0 3px #0e1116, 0 0 3px #0e1116, 0 0 3px #0e1116; }
+  .lbl.cam3d { color: #fff; font-size: 11px; } .lbl.cam3d.hl { color: var(--accent); }
+  select { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 6px; font: inherit; }
+  #tip { position: absolute; z-index: 2; pointer-events: none; background: rgba(13,17,23,.92);
     border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12px;
     display: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
   #cams { flex: 1; min-height: 0; display: grid; gap: 8px; padding: 8px;
@@ -90,6 +98,8 @@
     <label>軌跡長度 <input id="trail" type="range" min="5" max="120" value="20"> <b id="trailVal">20</b>s</label>
     <label><input id="showIds" type="checkbox" checked> ID</label>
     <label><input id="showCams" type="checkbox" checked> 攝影機位置</label>
+    <button id="mode3d" title="切換 2D 平面 / 3D 立體">3D 視圖</button>
+    <select id="viewSel" hidden title="3D 視角"><option value="">自由視角</option></select>
     <button id="pause">暫停</button>
     <button id="clear">清除軌跡</button>
   </div>
@@ -97,7 +107,7 @@
 <div id="toasts" role="status" aria-live="polite"></div>
 <main>
   <section class="panel">
-    <div class="panel-title"><span>Bird-Eye View（mdx-bev）</span><span>滾輪縮放 · 拖曳平移 · 雙擊重置 · 滑過軌跡頭可看座標</span></div>
+    <div class="panel-title"><span>Bird-Eye View（mdx-bev）</span><span id="hint">滾輪縮放 · 拖曳平移 · 雙擊重置 · 滑過軌跡頭可看座標</span></div>
     <div id="bevWrap"><canvas id="bev"></canvas><div id="tip"></div></div>
   </section>
   <section class="panel">
@@ -105,6 +115,11 @@
     <div id="cams"></div>
   </section>
 </main>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
 <script>
 const $ = id => document.getElementById(id);
 const canvas = $("bev"), ctx = canvas.getContext("2d"), tip = $("tip");
@@ -129,7 +144,26 @@ let frameCount = 0, lastMsgAt = 0;
 const HIGHLIGHT_MS = 5000;
 const alerts = [];                 // 碰撞高亮：{ids, primary, until}
 
-const color = id => `hsl(${(parseInt(id, 10) * 137.508) % 360} 85% 60%)`;
+// 顏色：新軌跡出現時，挑一個跟畫面上現有軌跡色相差最遠的；避開紅色（碰撞警告專用）。
+// 同一個 ID 之後再出現時沿用原本的顏色。
+const colorCache = new Map();      // id -> {h, css}
+const hueDist = (a, b) => { const d = Math.abs(a - b) % 360; return Math.min(d, 360 - d); };
+function color(id) {
+  let c = colorCache.get(id);
+  if (c) return c.css;
+  if (colorCache.size > 500) for (const k of colorCache.keys()) if (!tracks.has(k)) colorCache.delete(k);
+  const used = [...tracks.keys()].filter(k => k !== id && colorCache.has(k)).map(k => colorCache.get(k).h);
+  let best = 0, bestD = -1;
+  for (let i = 0; i < 24; i++) {
+    const h = 25 + Math.random() * 310;            // 25°～335°，不含紅色
+    const d = used.length ? Math.min(...used.map(u => hueDist(h, u))) : Math.random();
+    if (d > bestD) { bestD = d; best = h; }
+  }
+  const l = [58, 66, 52][colorCache.size % 3];     // 亮度輪替，色相接近時也分得出來
+  c = { h: best, css: `hsl(${best.toFixed(0)} 85% ${l}%)` };
+  colorCache.set(id, c);
+  return c.css;
+}
 // 類別 → 分組（計數）與標記形狀
 const groupOf = t => t === "Person" ? "person" : t === "Transporter" ? "cart" : /Humanoid|Carter/.test(t) ? "robot" : "other";
 const TYPE_ZH = { Person: "人", Transporter: "推車", Agility_Digit_Humanoid: "人形機器人 Digit",
@@ -149,6 +183,7 @@ const toPx = (x, y) => {          // world -> map px -> canvas px
 
 function resize() {
   const r = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  if (!r.width || !r.height) return;   // 3D 模式時 2D 畫布被隱藏，量到 0 會把畫面縮成 0
   canvas.width = r.width * dpr; canvas.height = r.height * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   if (cfg) {
@@ -164,19 +199,20 @@ function onFrame(f) {
   if (paused) return;
   frameCount++; lastMsgAt = performance.now();
   latestT = Math.max(latestT, f.t);
-  for (const [id, x, y, type] of f.o) {
+  for (const [id, x, y, type, ...dim] of f.o) {
     let tr = tracks.get(id);
     if (!tr) tracks.set(id, tr = { pts: [], last: 0, type: "" });
     tr.pts.push([f.t, x, y]); tr.last = f.t; tr.type = type || tr.type;
+    if (dim.length >= 4) tr.dim = dim;            // [w, l, h, yaw]（3D 視圖用）
   }
 }
 
 function draw() {
   requestAnimationFrame(draw);
   if (!cfg) return;
-  const r = canvas.getBoundingClientRect();
+  const r = canvas.getBoundingClientRect(), is3d = !!view3d;
   ctx.clearRect(0, 0, r.width, r.height);
-  if (mapImg.complete) ctx.drawImage(mapImg, view.ox, view.oy, cfg.map.w * view.s, cfg.map.h * view.s);  // 整張畫，crop 只影響置中與比例
+  if (!is3d && mapImg.complete) ctx.drawImage(mapImg, view.ox, view.oy, cfg.map.w * view.s, cfg.map.h * view.s);  // 整張畫，crop 只影響置中與比例
 
   const trailMs = $("trail").value * 1000, cutoff = latestT - trailMs;
   const counts = { person: 0, robot: 0, cart: 0, other: 0 };
@@ -186,7 +222,7 @@ function draw() {
     if (!tr.pts.length) { tracks.delete(id); continue; }
     const c = color(id), live = latestT - tr.last < 1000, hl = hoverId === id;
     ctx.lineWidth = hl ? 4 : 2.5; ctx.lineJoin = ctx.lineCap = "round";
-    for (let i = 1; i < tr.pts.length; i++) {      // 舊→新 漸亮
+    for (let i = 1; !is3d && i < tr.pts.length; i++) {      // 舊→新 漸亮
       const [t0, x0, y0] = tr.pts[i - 1], [, x1, y1] = tr.pts[i];
       ctx.globalAlpha = 0.15 + 0.85 * (t0 - cutoff) / trailMs;
       ctx.strokeStyle = c; ctx.beginPath();
@@ -198,6 +234,7 @@ function draw() {
       counts[g]++;
       const [, x, y] = tr.pts[tr.pts.length - 1], [px, py] = toPx(x, y);
       heads.push({ id, px, py, x, y, type: tr.type });
+      if (is3d) continue;
       ctx.fillStyle = c; ctx.strokeStyle = "#0e1116"; ctx.lineWidth = 2;
       marker(g, px, py, hl ? 8 : 6); ctx.fill(); ctx.stroke();
       if ($("showIds").checked) {
@@ -206,10 +243,16 @@ function draw() {
       }
     }
   }
-  draw.heads = heads;
-  drawAlerts(heads);
+  if (is3d) {
+    for (let i = alerts.length - 1; i >= 0; i--) if (alerts[i].until < performance.now()) alerts.splice(i, 1);
+    draw.heads = view3d.render({ tracks, heads, cutoff, trailMs, alerts, hoverId, hoverCam,
+      showIds: $("showIds").checked, showCams: $("showCams").checked });
+  } else {
+    draw.heads = heads;
+    drawAlerts(heads);
+  }
 
-  if ($("showCams").checked) for (const cam of cfg.cameras) {
+  if (!is3d && $("showCams").checked) for (const cam of cfg.cameras) {
     if (cam.x == null) continue;
     const [px, py] = toPx(cam.x, cam.y), hl = hoverCam === cam.name;
     ctx.fillStyle = hl ? "#76b900" : "rgba(255,255,255,.9)"; ctx.strokeStyle = "#0e1116"; ctx.lineWidth = 2;
@@ -269,7 +312,7 @@ function onIncident(inc) {
   setTimeout(() => el.remove(), HIGHLIGHT_MS);
 }
 
-canvas.addEventListener("mousemove", e => {
+$("bevWrap").addEventListener("mousemove", e => {
   const r = canvas.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
   let best = null, bd = 18 * 18;
   for (const h of draw.heads || []) { const d = (h.px - mx) ** 2 + (h.py - my) ** 2; if (d < bd) { bd = d; best = h; } }
@@ -279,7 +322,7 @@ canvas.addEventListener("mousemove", e => {
     tip.innerHTML = `${TYPE_ZH[best.type] || best.type || "?"} · ID <b style="color:${color(best.id)}">${best.id}</b> · x ${best.x.toFixed(2)} m · y ${best.y.toFixed(2)} m`;
   } else tip.style.display = "none";
 });
-canvas.addEventListener("mouseleave", () => { hoverId = null; tip.style.display = "none"; });
+$("bevWrap").addEventListener("mouseleave", () => { hoverId = null; tip.style.display = "none"; });
 // 縮放／平移：以游標為中心縮放，拖曳平移，雙擊重置
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
@@ -295,6 +338,38 @@ canvas.addEventListener("pointerdown", e => { dragFrom = [e.clientX - pan[0], e.
 canvas.addEventListener("pointermove", e => { if (dragFrom) { pan = [e.clientX - dragFrom[0], e.clientY - dragFrom[1]]; resize(); } });
 canvas.addEventListener("pointerup", () => { dragFrom = null; canvas.classList.remove("drag"); });
 canvas.addEventListener("dblclick", () => { zoom = 1; pan = [0, 0]; resize(); });
+
+// 3D 視圖：第一次切換時才載入 three.js 與 bev3d.js
+let view3d = null, view3dObj = null;
+const HINT2D = $("hint").textContent, HINT3D = "左鍵拖曳旋轉 · 右鍵拖曳平移 · 滾輪縮放 · 雙擊重置 · 視角可切到各攝影機";
+async function set3d(on) {
+  const btn = $("mode3d");
+  if (on && !view3dObj) {
+    btn.disabled = true; btn.textContent = "載入中…";
+    try {
+      const m = await import("/bev3d.js");
+      view3dObj = m.create($("bevWrap"), { cfg, crop, mapUrl: "/map.png", colorOf: color, groupOf });
+      for (const n of view3dObj.cameras) $("viewSel").add(new Option(`${n} 視角`, n));
+    } catch (err) {
+      console.error(err);
+      onToast("3D 載入失敗", "無法載入 three.js（需能連到 cdn.jsdelivr.net）");
+      on = false;
+    } finally { btn.disabled = false; }
+  }
+  view3d = on ? view3dObj : null;
+  $("bevWrap").classList.toggle("is3d", on);
+  if (!on) resize();                   // 隱藏期間視窗可能變過大小，切回 2D 時重算
+  btn.textContent = on ? "2D 視圖" : "3D 視圖"; btn.classList.toggle("on", on);
+  $("viewSel").hidden = !on; $("hint").textContent = on ? HINT3D : HINT2D;
+  try { localStorage.setItem("bev-mode", on ? "3d" : "2d"); } catch {}
+}
+function onToast(title, body) {
+  const el = document.createElement("div"); el.className = "toast";
+  el.innerHTML = `<div class="t-title">${title}</div><div class="t-body">${body}</div>`;
+  $("toasts").prepend(el); setTimeout(() => el.remove(), HIGHLIGHT_MS);
+}
+$("mode3d").onclick = () => set3d(!view3d);
+$("viewSel").onchange = e => view3d && view3d.lookFrom(e.target.value);
 
 $("trail").oninput = e => $("trailVal").textContent = e.target.value;
 $("pause").onclick = e => { paused = !paused; e.target.textContent = paused ? "繼續" : "暫停"; e.target.classList.toggle("on", paused); };
@@ -331,6 +406,8 @@ fetch("/config.json").then(r => r.json()).then(c => {
   es.onmessage = e => onFrame(JSON.parse(e.data));
   es.addEventListener("incident", e => onIncident(JSON.parse(e.data)));
   requestAnimationFrame(draw);
+  let saved = null; try { saved = localStorage.getItem("bev-mode"); } catch {}
+  if (saved === "3d") (mapImg.complete ? set3d(true) : mapImg.addEventListener("load", () => set3d(true), { once: true }));
 });
 </script>
 </body>

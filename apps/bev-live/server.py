@@ -9,7 +9,8 @@
 - /events      SSE：mdx-bev 每一幀 {t, o:[[id,x,y,type],...]}；
                碰撞（Proximity Violation）事件以 `event: incident` 推送 {start, ids, types, category}
 - /cam/<name>  MJPEG：從 VST 拉 RTSP，降解析度後轉送（沒人看時自動停）
-- /config.json 地圖尺寸、T_ov2px、攝影機位置
+- /config.json 地圖尺寸、T_ov2px、攝影機位置與內外參
+- /bev3d.js    3D 視圖（three.js，從 jsDelivr 載入）
 """
 import argparse, json, os, queue, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,8 +47,12 @@ for s in json.loads(Path(args.calibration).read_text())["sensors"]:
     if s.get("type") != "camera":
         continue
     d = next((a["value"] for a in s.get("attributes", []) if a["name"] == "direction"), None)
+    attr = {a["name"]: a["value"] for a in s.get("attributes", [])}
     cams_cal[s["id"]] = {"x": s["coordinates"]["x"], "y": s["coordinates"]["y"],
-                         "dir": float(d) if d is not None else None}
+                         "dir": float(d) if d is not None else None,
+                         # 3D 視圖用：外參 [R|t]、內參 K、影像尺寸 -> 攝影機位置與視錐
+                         "ext": s.get("extrinsicMatrix"), "K": s.get("intrinsicMatrix"),
+                         "wh": [int(attr.get("frameWidth") or 1920), int(attr.get("frameHeight") or 1080)]}
 
 
 def vst_get(path):
@@ -105,11 +110,18 @@ def kafka_loop():
             continue  # 亂序/重複
         last_bucket = bucket
         t = f.timestamp.seconds * 1000 + f.timestamp.nanos // 1_000_000
-        # [id, x, y, type]；type 用來在前端分類計數與換形狀
-        payload = json.dumps({"t": t, "o": [[o.id, round(o.bbox3d.coordinates[0], 3),
-                                             round(o.bbox3d.coordinates[1], 3), o.type]
-                                            for o in f.objects if len(o.bbox3d.coordinates) >= 2]},
-                             separators=(",", ":"))
+        # [id, x, y, type(, w, l, h, yaw)]；type 用來分類計數與換形狀，
+        # 尺寸與朝向（bbox3d 9-DoF: x y z w l h pitch roll yaw）給 3D 視圖
+        objs = []
+        for o in f.objects:
+            bb = o.bbox3d.coordinates  # 別用 c：那是外層的 Kafka consumer
+            if len(bb) < 2:
+                continue
+            row = [o.id, round(bb[0], 3), round(bb[1], 3), o.type]
+            if len(bb) >= 9:
+                row += [round(bb[3], 2), round(bb[4], 2), round(bb[5], 2), round(bb[8], 3)]
+            objs.append(row)
+        payload = json.dumps({"t": t, "o": objs}, separators=(",", ":"))
         stats["frames"] += 1
         stats["last_t"] = t
         for o in f.objects:
@@ -291,6 +303,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             return self.send_bytes((HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
+        if path == "/bev3d.js":
+            return self.send_bytes((HERE / "bev3d.js").read_bytes(), "text/javascript; charset=utf-8")
         if path == "/map.png":
             return self.send_bytes((HERE / "map.png").read_bytes(), "image/png", "max-age=3600")
         if path == "/config.json":
